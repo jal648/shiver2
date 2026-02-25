@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shiver 2</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #000;
+      overflow: hidden;
+      font-family: monospace;
+    }
+
+    #canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: pointer;
+    }
+
+    #status {
+      position: fixed;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      pointer-events: none;
+      transition: opacity 0.5s;
+    }
+
+    .status-connecting   { background: rgba(255,200,0,0.15); color: #ffcc00; }
+    .status-connected    { background: rgba(0,255,100,0.12); color: #00ff64; }
+    .status-disconnected { background: rgba(255,60,60,0.15); color: #ff4040; }
+
+    #hint {
+      position: fixed;
+      bottom: 18px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: rgba(255,255,255,0.25);
+      font-size: 11px;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="status" class="status-connecting">connecting</div>
+  <div id="hint">click to enable audio</div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
