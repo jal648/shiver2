@@ -1,0 +1,13 @@
+{
+  "min_area_frac": 0.002,
+  "max_area_frac": 0.08,
+  "max_aspect": 4.0,
+  "expected_block_frac": 0.0,
+  "color_ranges": [
+    ["red",    0,   10,  80, 80],
+    ["red",    170, 180, 80, 80],
+    ["yellow", 20,  38,  80, 100],
+    ["green",  40,  80,  80, 50],
+    ["blue",   100, 130, 80, 50]
+  ]
+}
