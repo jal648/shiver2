@@ -15,11 +15,14 @@ Environment:
 
 import argparse
 import asyncio
+import json
 import logging
+import os
 import time
 from dataclasses import asdict
 
 import cv2
+import numpy as np
 
 from detector import BlockDetector
 from server import WebSocketServer
@@ -40,6 +43,8 @@ MAX_AREA_FRAC = 0.08    # largest valid block
 
 TARGET_FPS = 30         # camera capture target
 
+ZONE_FILE = os.path.join(os.path.dirname(__file__), "zone.json")
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def crop_roi(frame, roi):
@@ -49,9 +54,44 @@ def crop_roi(frame, roi):
     return frame[y:y+h, x:x+w]
 
 
-def build_state(blocks, timestamp: float) -> dict:
+def load_zone() -> dict:
+    """Load zone.json and always return {"corners": [[TL,TR,BR,BL]...]}.
+
+    Accepts both the new corners format and the old {x,y,w,h} rectangle format.
+    Defaults to the full frame (identity transform) if the file is missing.
+    """
+    try:
+        with open(ZONE_FILE) as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return {"corners": [[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0]]}
+
+    if "corners" in d:
+        return d
+
+    # Convert old rectangle format to corners
+    x, y, w, h = d.get("x",0.0), d.get("y",0.0), d.get("w",1.0), d.get("h",1.0)
+    return {"corners": [[x,y],[x+w,y],[x+w,y+h],[x,y+h]]}
+
+
+def build_homography(zone: dict) -> np.ndarray:
+    """Compute perspective transform matrix that maps the zone trapezoid → [0,1]²."""
+    src = np.float32(zone["corners"])                          # TL TR BR BL in image space
+    dst = np.float32([[0,0],[1,0],[1,1],[0,1]])                # unit square
+    return cv2.getPerspectiveTransform(src, dst)
+
+
+def apply_homography(block, H: np.ndarray) -> tuple[float, float]:
+    """Return the perspective-corrected (x, y) for a block."""
+    pt  = np.array([[[block.x, block.y]]], dtype=np.float32)
+    out = cv2.perspectiveTransform(pt, H)
+    return float(out[0][0][0]), float(out[0][0][1])
+
+
+def build_state(blocks, zone: dict, timestamp: float) -> dict:
     return {
         "blocks": [asdict(b) for b in blocks],
+        "zone": zone,
         "timestamp": timestamp,
     }
 
@@ -70,6 +110,9 @@ async def camera_loop(camera_index: int, ws_server: WebSocketServer, debug: bool
         min_area_frac=MIN_AREA_FRAC,
         max_area_frac=MAX_AREA_FRAC,
     )
+    zone = load_zone()
+    H    = build_homography(zone)
+    logger.info("Active zone corners: %s", zone["corners"])
 
     try:
         while True:
@@ -82,11 +125,24 @@ async def camera_loop(camera_index: int, ws_server: WebSocketServer, debug: bool
             roi_frame = crop_roi(frame, TABLE_ROI)
             blocks = detector.detect(roi_frame)
 
-            state = build_state(blocks, time.time())
+            # Apply perspective correction and keep only blocks inside the unit square
+            active = []
+            for b in blocks:
+                b.x, b.y = apply_homography(b, H)
+                if 0.0 <= b.x <= 1.0 and 0.0 <= b.y <= 1.0:
+                    active.append(b)
+
+            # Corrected coordinates span the full [0,1]² area
+            broadcast_zone = {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+            state = build_state(active, broadcast_zone, time.time())
             await ws_server.broadcast(state)
 
             if debug:
-                annotated = detector.debug_frame(roi_frame, blocks)
+                annotated = detector.debug_frame(roi_frame, active)
+                # Draw trapezoid zone on debug frame
+                fh, fw = annotated.shape[:2]
+                pts = np.int32([[int(c[0]*fw), int(c[1]*fh)] for c in zone["corners"]])
+                cv2.polylines(annotated, [pts], isClosed=True, color=(200, 220, 0), thickness=2)
                 cv2.imshow("Shiver2 — vision debug", annotated)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
