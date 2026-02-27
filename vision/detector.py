@@ -1,13 +1,15 @@
 """
 Block detector — finds bright Duplo blocks on a matte black table.
 
-Pipeline:
-  BGR frame → HSV → per-color masks → OR → morphological cleanup
-  → contour detection → optional watershed split → area/aspect filter
-  → pixel-vote color classification → stable ID assignment
+Pipeline (per color):
+  BGR frame → HSV → per-color narrow mask → morphological cleanup
+  → contour detection → area/aspect filter → NMS dedup
+  → stable ID assignment
+
+Color is implicit: each block inherits the name of the mask it came from.
+No post-hoc classification step needed.
 """
 
-import math
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -40,33 +42,60 @@ DEFAULT_COLOR_RANGES: list[list] = [
 ]
 
 
+def _nms(
+    detections: list[tuple],
+    threshold: float = 0.05,
+) -> list[tuple]:
+    """
+    Remove duplicate detections of the same color that are too close together.
+
+    Needed because red has two H-range entries; both may fire on the same block.
+    Greedy: keep largest-area detection first, suppress anything within
+    `threshold` normalized units of the same color.
+
+    detections: list of (cx, cy, bw, bh, color)
+    """
+    sorted_dets = sorted(detections, key=lambda d: d[2] * d[3], reverse=True)
+    kept: list[tuple] = []
+    for det in sorted_dets:
+        cx, cy, _, _, color = det
+        duplicate = False
+        for k in kept:
+            if k[4] == color:
+                dist = ((cx - k[0]) ** 2 + (cy - k[1]) ** 2) ** 0.5
+                if dist < threshold:
+                    duplicate = True
+                    break
+        if not duplicate:
+            kept.append(det)
+    return kept
+
+
 class BlockDetector:
     """
     Detects Duplo blocks in a camera frame and tracks them across frames
     with stable IDs via nearest-neighbour matching.
 
-    Detection uses per-color HSV masks (OR-ed together), so only saturated,
-    on-hue pixels are included — black table and specular highlights are ignored.
+    Detection uses per-color narrow HSV masks processed independently, so each
+    block's color is determined by which mask it came from — no post-hoc
+    classification step is needed.
 
-    Classification uses pixel voting (count matching pixels per color) which
-    correctly handles red's hue wraparound and is robust to partial shadows.
-
-    When expected_block_frac > 0, merged blobs are split via watershed using
-    the known physical block size as the minimum seed distance.
+    Red's two H-range entries (0-10 and 170-180) are automatically deduped
+    using NMS so a single red block is never reported twice.
     """
 
     def __init__(
         self,
-        min_area_frac: float = 0.001,   # min block area as fraction of ROI
-        max_area_frac: float = 0.10,    # max block area as fraction of ROI
-        max_aspect: float = 4.0,        # max width/height ratio
-        color_ranges: Optional[list] = None,   # per-color HSV ranges
-        expected_block_frac: float = 0.0,      # expected block width as fraction of ROI width
+        min_area_frac: float = 0.001,
+        max_area_frac: float = 0.10,
+        max_aspect: float = 4.0,
+        color_ranges: Optional[list] = None,
+        smoothing: float = 0.4,   # EMA alpha: 0=frozen, 1=no smoothing
     ):
-        self.min_area_frac      = min_area_frac
-        self.max_area_frac      = max_area_frac
-        self.max_aspect         = max_aspect
-        self.expected_block_frac = expected_block_frac
+        self.min_area_frac = min_area_frac
+        self.max_area_frac = max_area_frac
+        self.max_aspect    = max_aspect
+        self.smoothing     = smoothing
         self.color_ranges: list[list] = (
             [list(r) for r in color_ranges]
             if color_ranges is not None
@@ -80,25 +109,6 @@ class BlockDetector:
         # Stats updated each detect() call — readable by debug panel
         self.last_contour_count   = 0
         self.last_detection_count = 0
-
-    # ------------------------------------------------------------------
-    def _make_binary(self, hsv: np.ndarray) -> np.ndarray:
-        """
-        Return raw binary mask before morphological cleanup.
-
-        Pixel is 255 if it matches ANY per-color H/S/V range, 0 otherwise.
-        The black table (low S+V) and specular highlights (high V, low S) are
-        both excluded since they don't match any color's S_min/V_min.
-        """
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for _, h_lo, h_hi, s_min, v_min in self.color_ranges:
-            m = cv2.inRange(
-                hsv,
-                np.array([h_lo, s_min, v_min], dtype=np.uint8),
-                np.array([h_hi, 255,   255  ], dtype=np.uint8),
-            )
-            mask = cv2.bitwise_or(mask, m)
-        return mask
 
     # ------------------------------------------------------------------
     def _color_mask(self, name: str, hsv: np.ndarray) -> np.ndarray:
@@ -117,104 +127,45 @@ class BlockDetector:
         return mask
 
     # ------------------------------------------------------------------
-    def _classify_color(self, hsv_frame: np.ndarray, contour: np.ndarray) -> str:
-        """
-        Return the dominant Duplo color for the region covered by `contour`.
-
-        Uses pixel voting: count how many pixels inside the contour match each
-        color's H/S/V range, then return the winner.  This avoids the hue-mean
-        wraparound bug (a red blob spanning H=2 and H=178 would average to
-        H≈90 = green using cv2.mean, but pixel counting handles it correctly).
-        Both red range entries naturally accumulate into the same "red" bucket.
-        """
-        contour_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
-        cv2.drawContours(contour_mask, [contour], -1, 255, thickness=cv2.FILLED)
-        total = cv2.countNonZero(contour_mask)
-        if total == 0:
-            return "unknown"
-
-        votes: dict[str, int] = {}
-        for name, h_lo, h_hi, s_min, v_min in self.color_ranges:
-            color_px = cv2.inRange(
-                hsv_frame,
+    def _make_binary(self, hsv: np.ndarray) -> np.ndarray:
+        """Return combined binary mask (OR of all color entries) — used by get_stages()."""
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for _, h_lo, h_hi, s_min, v_min in self.color_ranges:
+            m = cv2.inRange(
+                hsv,
                 np.array([h_lo, s_min, v_min], dtype=np.uint8),
                 np.array([h_hi, 255,   255  ], dtype=np.uint8),
             )
-            count = cv2.countNonZero(cv2.bitwise_and(contour_mask, color_px))
-            votes[name] = votes.get(name, 0) + count   # two red entries accumulate
-
-        if not votes:
-            return "unknown"
-        best_name  = max(votes, key=votes.get)
-        best_count = votes[best_name]
-        # Require at least 15% of contour pixels to match (avoids noise wins)
-        if best_count / total < 0.15:
-            return "unknown"
-        return best_name
+            mask = cv2.bitwise_or(mask, m)
+        return mask
 
     # ------------------------------------------------------------------
-    def _split_blob(
-        self,
-        frame: np.ndarray,
-        blob_mask: np.ndarray,
-        block_radius_px: float,
-    ) -> Optional[list]:
+    def get_color_edges(
+        self, name: str, frame: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Use watershed to split a merged blob into individual block contours.
+        Return (binary_mask, edge_mask) for one named color.
 
-        Finds local maxima in the distance transform separated by at least
-        block_radius_px pixels, then segments the blob accordingly.
+        binary_mask — morphologically cleaned color binary (255 = color present)
+        edge_mask   — Canny edges of the binary (255 = edge pixel)
 
-        Returns a list of contours (one per block), or None if no split found.
+        Used by the debug edge-view overlay.
         """
-        dist = cv2.distanceTransform(blob_mask, cv2.DIST_L2, 5)
-
-        # Dilate-and-compare local maxima with kernel sized to block radius
-        kern_sz = max(3, int(block_radius_px * 2) | 1)   # must be odd
-        kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kern_sz, kern_sz))
-        dilated = cv2.dilate(dist, kernel)
-
-        # Peak pixels: must be a local maximum AND deep enough in the blob
-        min_depth = max(1.0, block_radius_px * 0.3)
-        peaks = np.uint8((dist >= dilated - 0.001) & (dist > min_depth)) * 255
-
-        n_labels, markers = cv2.connectedComponents(peaks)
-        if n_labels <= 2:   # 0=background + 1 blob = no split
-            return None
-
-        # Watershed needs a 3-channel image; unknown region = 0 in markers
-        markers = markers.astype(np.int32)
-        markers[blob_mask == 0] = -1   # mark background as -1
-        # Reset unknown interior to 0 for watershed to fill
-        interior = cv2.erode(blob_mask, kernel, iterations=1)
-        markers[(blob_mask > 0) & (interior == 0) & (peaks == 0)] = 0
-
-        cv2.watershed(frame, markers)
-
-        result = []
-        for label in range(1, n_labels):
-            seg = np.uint8(markers == label) * 255
-            cnts, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if cnts:
-                result.append(max(cnts, key=cv2.contourArea))
-
-        return result if len(result) > 1 else None
+        hsv     = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        raw     = self._color_mask(name, hsv)
+        kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        cleaned = cv2.morphologyEx(raw,     cv2.MORPH_OPEN,  kernel, iterations=2)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)
+        edges   = cv2.Canny(cleaned, 30, 100)
+        return cleaned, edges
 
     # ------------------------------------------------------------------
     def get_stages(self, frame: np.ndarray) -> dict[str, np.ndarray]:
         """
         Return intermediate pipeline images as BGR frames for the debug viewer.
 
-        Keys:
-          "binary"      — raw combined color mask
-          "cleaned"     — after morphological open+close
-          "hsv_h"       — hue channel as false-colour
-          "hsv_s"       — saturation channel (greyscale)
-          "hsv_v"       — value channel (greyscale)
-          "mask_red"    — original pixels where red mask fires
-          "mask_yellow" — original pixels where yellow mask fires
-          "mask_green"  — original pixels where green mask fires
-          "mask_blue"   — original pixels where blue mask fires
+        Keys: binary, cleaned, hsv_h, hsv_s, hsv_v,
+              mask_red, mask_yellow, mask_green, mask_blue
         """
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
@@ -241,7 +192,6 @@ class BlockDetector:
             "hsv_s":   gray_bgr(hsv[:, :, 1]),
             "hsv_v":   gray_bgr(hsv[:, :, 2]),
         }
-
         for color in ("red", "yellow", "green", "blue"):
             cm = self._color_mask(color, hsv)
             stages[f"mask_{color}"] = cv2.bitwise_and(frame, frame, mask=cm)
@@ -253,72 +203,59 @@ class BlockDetector:
         """
         Process one BGR frame and return tracked blocks.
 
+        Iterates each color's HSV range independently. Blocks inherit the color
+        of the mask they came from — no post-hoc classification needed.
+
         Args:
             frame: BGR image (already cropped to table ROI by caller)
 
         Returns:
             List of Block objects with normalized coordinates, velocity, and color.
         """
-        h, w = frame.shape[:2]
+        h, w     = frame.shape[:2]
         roi_area = w * h
 
-        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        # --- 1. Build binary mask from per-color HSV ranges
-        binary = self._make_binary(hsv_frame)
-
-        # --- 2. Morphological cleanup (remove noise, fill gaps)
+        hsv    = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel, iterations=2)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        # --- 3. Find contours
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        self.last_contour_count = len(contours)
+        raw: list[tuple[float, float, float, float, str]] = []
+        total_contours = 0
 
-        # --- 3b. Optional watershed split for overlapping blocks
-        block_radius_px = self.expected_block_frac * min(w, h) / 2
-        if block_radius_px > 0:
-            expected_area = math.pi * block_radius_px ** 2
-            split_contours: list = []
-            for cnt in contours:
+        for name, h_lo, h_hi, s_min, v_min in self.color_ranges:
+            mask = cv2.inRange(
+                hsv,
+                np.array([h_lo, s_min, v_min], dtype=np.uint8),
+                np.array([h_hi, 255,   255  ], dtype=np.uint8),
+            )
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=2)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            total_contours += len(cnts)
+
+            for cnt in cnts:
                 area = cv2.contourArea(cnt)
-                if area > expected_area * 1.6:
-                    blob_mask = np.zeros((h, w), dtype=np.uint8)
-                    cv2.drawContours(blob_mask, [cnt], -1, 255, cv2.FILLED)
-                    parts = self._split_blob(frame, blob_mask, block_radius_px)
-                    if parts:
-                        split_contours.extend(parts)
-                        continue
-                split_contours.append(cnt)
-            contours = split_contours
+                if not (self.min_area_frac <= area / roi_area <= self.max_area_frac):
+                    continue
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                aspect = max(bw, bh) / max(min(bw, bh), 1)
+                if aspect > self.max_aspect:
+                    continue
+                cx = (bx + bw / 2) / w
+                cy = (by + bh / 2) / h
+                raw.append((cx, cy, bw / w, bh / h, name))
 
-        # --- 4. Filter by area and aspect ratio; classify color via pixel vote
-        raw_detections: list[tuple[float, float, float, float, str]] = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            area_frac = area / roi_area
-            if not (self.min_area_frac <= area_frac <= self.max_area_frac):
-                continue
+        self.last_contour_count = total_contours
 
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-            aspect = max(bw, bh) / max(min(bw, bh), 1)
-            if aspect > self.max_aspect:
-                continue
+        # Remove duplicates (e.g. both red entries firing on same block)
+        deduped = _nms(raw, threshold=0.05)
+        self.last_detection_count = len(deduped)
 
-            cx = (bx + bw / 2) / w
-            cy = (by + bh / 2) / h
-            color = self._classify_color(hsv_frame, cnt)
-            raw_detections.append((cx, cy, bw / w, bh / h, color))
-
-        self.last_detection_count = len(raw_detections)
-
-        # --- 5. Match to previous blocks and assign stable IDs
         now = time.monotonic()
-        dt = (now - self._prev_time) if self._prev_time is not None else 0.0
+        dt  = (now - self._prev_time) if self._prev_time is not None else 0.0
         self._prev_time = now
 
-        blocks = self._assign_ids(raw_detections, dt)
+        blocks = self._assign_ids(deduped, dt)
         self._prev_blocks = blocks
         return blocks
 
@@ -350,13 +287,18 @@ class BlockDetector:
                 dist = ((cx - prev.x) ** 2 + (cy - prev.y) ** 2) ** 0.5
                 if dist < best_dist:
                     best_dist = dist
-                    best_idx = i
+                    best_idx  = i
 
             if best_idx is not None and best_dist < 0.15:
                 prev = self._prev_blocks[best_idx]
-                vx = (cx - prev.x) / dt if dt > 0 else 0.0
-                vy = (cy - prev.y) / dt if dt > 0 else 0.0
-                matched.append(Block(id=prev.id, x=cx, y=cy, w=bw, h=bh, vx=vx, vy=vy, color=color))
+                a  = self.smoothing
+                sx = a * cx + (1 - a) * prev.x
+                sy = a * cy + (1 - a) * prev.y
+                sw = a * bw + (1 - a) * prev.w
+                sh = a * bh + (1 - a) * prev.h
+                vx = (sx - prev.x) / dt if dt > 0 else 0.0
+                vy = (sy - prev.y) / dt if dt > 0 else 0.0
+                matched.append(Block(id=prev.id, x=sx, y=sy, w=sw, h=sh, vx=vx, vy=vy, color=color))
                 used_prev.add(best_idx)
             else:
                 matched.append(Block(id=self._next_id, x=cx, y=cy, w=bw, h=bh, color=color))
