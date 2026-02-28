@@ -12,12 +12,14 @@
  *     vx: number, vy: number }
  */
 
+const socket_url =  "ws://localhost:8765"
+
 export class SocketClient {
   /**
    * @param {string} url  WebSocket URL, e.g. "ws://localhost:8765"
    * @param {(status: string) => void} onStatus  Status change callback
    */
-  constructor(url = "ws://localhost:8765", onStatus = () => {}) {
+  constructor(url=socket_url, onStatus = () => {}) {
     this.url = url;
     this.onStatus = onStatus;
     this._ws = null;

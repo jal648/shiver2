@@ -1,176 +1,296 @@
 /**
- * audio.js — Web Audio synthesis engine
+ * audio.js — BPM-synced drum sequencer + pentatonic synth engine
  *
- * Maps Duplo block positions to ambient synthesizer voices:
- *   - Y position  → pitch (lower on table = lower frequency)
- *   - X position  → stereo pan (left/right)
- *   - velocity    → filter brightness (fast movement = brighter tone)
+ * Blue blocks  → DrumVoice  (Tone.Transport @ 120 BPM)
+ *   y → drum type  (kick / snare / clap / open-hat / closed-hat)
+ *   x → filter cutoff
+ *   z → beat pattern  (0 = beat 1, 1 = beats 1+3, 2 = all four beats)
  *
- * One synth voice per tracked block ID. Voices fade in/out smoothly
- * when blocks appear or disappear.
+ * Other blocks → SynthVoice  (continuous pentatonic pads)
+ *   x → pentatonic pitch  (A minor, A2–A4)
+ *   y → filter cutoff  (bright at top, dark at bottom)
+ *   color → waveform  (red=sawtooth, green=square, yellow=triangle)
+ *   √(vx²+vy²) → volume
+ *   z → reverb wet  (0=dry, 1=medium, 2=heavy)
+ *
+ * Interface (same as before):
+ *   audio.unlock()        — call from first user gesture
+ *   audio.update(blocks)  — call each frame with current block array
  */
 
-const RAMP_TIME = 0.12;          // seconds for parameter transitions
-const MIN_FREQ = 110;            // Hz — bottom of the table (A2)
-const MAX_FREQ = 880;            // Hz — top of the table (A5)
-const VOICE_GAIN = 0.15;         // per-voice output level (headroom for polyphony)
-const REVERB_MIX = 0.6;          // 0 = dry, 1 = wet
+/* global Tone */
 
-// ── Reverb impulse (simple algorithmic approximation) ─────────────────────────
-function buildImpulseResponse(ctx, duration = 3.0, decay = 2.0) {
-  const sampleRate = ctx.sampleRate;
-  const length = sampleRate * duration;
-  const impulse = ctx.createBuffer(2, length, sampleRate);
-  for (let c = 0; c < 2; c++) {
-    const data = impulse.getChannelData(c);
-    for (let i = 0; i < length; i++) {
-      data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, decay);
-    }
-  }
-  return impulse;
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const PENTATONIC = ["A2", "C3", "D3", "E3", "G3", "A3", "C4", "D4", "E4", "G4", "A4"];
+
+const WAVEFORMS = { red: "sawtooth", green: "square", yellow: "triangle" };
+
+// Quarter-note beat patterns — null = skip, truthy = trigger
+const BEAT_PATTERNS = [
+  ["X", null, null, null],  // z=0: beat 1 only
+  ["X", null, "X",  null],  // z=1: beats 1 + 3
+  ["X", "X",  "X",  "X" ], // z=2: all four beats
+];
+
+const REVERB_WET = [0.0, 0.4, 0.85];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Logarithmic interpolation: t=0 → minHz, t=1 → maxHz */
+function logCutoff(t, minHz, maxHz) {
+  return Math.exp(Math.log(minHz) + t * (Math.log(maxHz) - Math.log(minHz)));
 }
 
-// ── Voice ─────────────────────────────────────────────────────────────────────
-class Voice {
-  constructor(ctx, destination) {
-    this.ctx = ctx;
+/** Return drum type index 0–4 from y position */
+function drumTypeIdx(y) {
+  if (y < 0.2) return 0; // kick
+  if (y < 0.4) return 1; // snare
+  if (y < 0.6) return 2; // clap
+  if (y < 0.8) return 3; // open hi-hat
+  return 4;              // closed hi-hat
+}
 
-    // Oscillator (sine wave for a clean, ambient tone)
-    this.osc = ctx.createOscillator();
-    this.osc.type = "sine";
-    this.osc.frequency.value = 440;
+/** Return pentatonic note name for x in [0, 1] */
+function noteForX(x) {
+  const i = Math.round(x * (PENTATONIC.length - 1));
+  return PENTATONIC[Math.max(0, Math.min(i, PENTATONIC.length - 1))];
+}
 
-    // Low-pass filter (cutoff tracks velocity)
-    this.filter = ctx.createBiquadFilter();
-    this.filter.type = "lowpass";
-    this.filter.frequency.value = 2000;
-    this.filter.Q.value = 0.7;
+// ── DrumVoice ─────────────────────────────────────────────────────────────────
 
-    // Gain (for fade in/out and overall level)
-    this.gain = ctx.createGain();
-    this.gain.gain.setValueAtTime(0, ctx.currentTime);
+class DrumVoice {
+  constructor(block, bus) {
+    this._typeIdx = -1; // force initial build
+    this._z = -1;       // force initial build
+    this._synth = null;
+    this._seq = null;
+    this._trigger = () => {};
 
-    // Stereo panner
-    this.panner = ctx.createStereoPanner();
-    this.panner.pan.value = 0;
+    this._filter = new Tone.Filter({ type: "lowpass", frequency: 2000, rolloff: -24 });
+    this._filter.connect(bus);
 
-    // Chain: osc → filter → gain → panner → destination
-    this.osc.connect(this.filter);
-    this.filter.connect(this.gain);
-    this.gain.connect(this.panner);
-    this.panner.connect(destination);
-
-    this.osc.start();
+    this._buildSynth(drumTypeIdx(block.y));
+    this._buildSeq(block.z);
+    this.update(block);
   }
 
-  /** Smoothly update voice parameters from a Block object. */
+  _buildSynth(typeIdx) {
+    if (typeIdx === this._typeIdx) return;
+    if (this._synth) { this._synth.disconnect(); this._synth.dispose(); }
+    this._typeIdx = typeIdx;
+
+    switch (typeIdx) {
+      case 0: { // kick — low thud, pitch drop
+        const s = new Tone.MembraneSynth({
+          pitchDecay: 0.08, octaves: 6,
+          envelope: { attack: 0.001, decay: 0.35, sustain: 0, release: 0.1 },
+          volume: -2,
+        });
+        this._trigger = (t) => s.triggerAttackRelease("C1", "16n", t);
+        this._synth = s;
+        break;
+      }
+      case 1: { // snare — white noise burst
+        const s = new Tone.NoiseSynth({
+          noise: { type: "white" },
+          envelope: { attack: 0.001, decay: 0.18, sustain: 0, release: 0.05 },
+          volume: -6,
+        });
+        this._trigger = (t) => s.triggerAttackRelease("16n", t);
+        this._synth = s;
+        break;
+      }
+      case 2: { // clap — pink noise, slightly softer
+        const s = new Tone.NoiseSynth({
+          noise: { type: "pink" },
+          envelope: { attack: 0.005, decay: 0.1, sustain: 0, release: 0.04 },
+          volume: -8,
+        });
+        this._trigger = (t) => s.triggerAttackRelease("16n", t);
+        this._synth = s;
+        break;
+      }
+      case 3: { // open hi-hat — longer metallic decay
+        const s = new Tone.MetalSynth({
+          frequency: 400, harmonicity: 5.1, modulationIndex: 32,
+          resonance: 4000, octaves: 1.5,
+          envelope: { attack: 0.001, decay: 0.5, release: 0.3 },
+          volume: -14,
+        });
+        this._trigger = (t) => s.triggerAttackRelease("8n", t);
+        this._synth = s;
+        break;
+      }
+      default: { // closed hi-hat — very short tick
+        const s = new Tone.MetalSynth({
+          frequency: 400, harmonicity: 5.1, modulationIndex: 32,
+          resonance: 4000, octaves: 1.5,
+          envelope: { attack: 0.001, decay: 0.07, release: 0.01 },
+          volume: -16,
+        });
+        this._trigger = (t) => s.triggerAttackRelease("32n", t);
+        this._synth = s;
+        break;
+      }
+    }
+    this._synth.connect(this._filter);
+  }
+
+  _buildSeq(z) {
+    if (this._seq) { this._seq.stop(); this._seq.dispose(); }
+    const pattern = BEAT_PATTERNS[z] ?? BEAT_PATTERNS[0];
+    this._seq = new Tone.Sequence(
+      (time, val) => { if (val) this._trigger(time); },
+      pattern,
+      "4n",
+    );
+    this._seq.start(0);
+    this._z = z;
+  }
+
   update(block) {
-    const t = this.ctx.currentTime;
-
-    const freq = MIN_FREQ + (1 - block.y) * (MAX_FREQ - MIN_FREQ);
-    this.osc.frequency.linearRampToValueAtTime(freq, t + RAMP_TIME);
-
-    const pan = block.x * 2 - 1;  // normalize 0–1 → -1 to +1
-    this.panner.pan.linearRampToValueAtTime(pan, t + RAMP_TIME);
-
-    const speed = Math.hypot(block.vx, block.vy);
-    const cutoff = 500 + Math.min(speed * 3000, 6000);
-    this.filter.frequency.linearRampToValueAtTime(cutoff, t + RAMP_TIME);
-
-    this.gain.gain.linearRampToValueAtTime(VOICE_GAIN, t + RAMP_TIME);
+    const t = drumTypeIdx(block.y);
+    if (t !== this._typeIdx) this._buildSynth(t);
+    if (block.z !== this._z) this._buildSeq(block.z);
+    this._filter.frequency.rampTo(logCutoff(block.x, 400, 8000), 0.1);
   }
 
-  /** Fade out and then stop. */
+  dispose() {
+    if (this._seq)   { this._seq.stop(); this._seq.dispose(); }
+    if (this._synth) { this._synth.disconnect(); this._synth.dispose(); }
+    this._filter.dispose();
+  }
+}
+
+// ── SynthVoice ────────────────────────────────────────────────────────────────
+
+class SynthVoice {
+  constructor(block, bus) {
+    this._z = -1;
+    const type = WAVEFORMS[block.color] ?? "sine";
+
+    this._synth  = new Tone.Synth({
+      oscillator: { type },
+      envelope: { attack: 0.5, decay: 0.2, sustain: 0.85, release: 3.0 },
+      portamento: 0.08,
+    });
+    this._filter = new Tone.Filter({ type: "lowpass", frequency: 3000, rolloff: -12 });
+    this._reverb = new Tone.Reverb({ decay: 3.5, wet: 0.0 });
+    this._panner = new Tone.Panner(0);
+    this._gain   = new Tone.Gain(Tone.dbToGain(-18));
+
+    this._synth.chain(this._filter, this._reverb, this._panner, this._gain, bus);
+    this._synth.triggerAttack(noteForX(block.x));
+    this.update(block);
+  }
+
+  update(block) {
+    // Pentatonic pitch from x
+    this._synth.frequency.rampTo(
+      Tone.Frequency(noteForX(block.x)).toFrequency(), 0.1,
+    );
+
+    // Filter cutoff from y — bright at top (y≈0), dark at bottom (y≈1)
+    this._filter.frequency.rampTo(logCutoff(1 - block.y, 200, 6000), 0.2);
+
+    // Volume from velocity magnitude
+    const mag = Math.hypot(block.vx, block.vy);
+    const db  = -20 + Math.min(mag / 0.4, 1) * 14; // -20 dB still → -6 dB fast
+    this._gain.gain.rampTo(Tone.dbToGain(db), 0.15);
+
+    // Stereo pan from x
+    this._panner.pan.rampTo(block.x * 2 - 1, 0.2);
+
+    // Reverb wet from z (only updated on change)
+    if (block.z !== this._z) {
+      this._z = block.z;
+      this._reverb.wet.rampTo(REVERB_WET[block.z] ?? 0, 0.3);
+    }
+  }
+
   release() {
-    const t = this.ctx.currentTime;
-    this.gain.gain.linearRampToValueAtTime(0, t + RAMP_TIME * 3);
-    setTimeout(() => this.osc.stop(), RAMP_TIME * 3 * 1000 + 50);
+    this._synth.triggerRelease();
+    setTimeout(() => {
+      try {
+        this._synth.dispose();
+        this._filter.dispose();
+        this._reverb.dispose();
+        this._panner.dispose();
+        this._gain.dispose();
+      } catch (_) { /* already disposed */ }
+    }, 5000);
   }
 }
 
 // ── AudioEngine ───────────────────────────────────────────────────────────────
+
 export class AudioEngine {
   constructor() {
-    this._ctx = null;
-    this._voices = new Map();  // block id → Voice
-    this._masterGain = null;
-    this._reverb = null;
-    this._reverbGain = null;
-    this._dryGain = null;
+    this._drumVoices  = new Map(); // id → DrumVoice
+    this._synthVoices = new Map(); // id → SynthVoice
+    this._drumBus  = null;
+    this._synthBus = null;
     this._ready = false;
   }
 
-  /**
-   * Must be called from a user gesture (click/tap) to unlock the AudioContext.
-   */
-  unlock() {
+  async unlock() {
     if (this._ready) return;
+    await Tone.start();
 
-    this._ctx = new AudioContext();
-    const ctx = this._ctx;
+    const limiter = new Tone.Limiter(-2).toDestination();
 
-    // Reverb
-    this._reverb = ctx.createConvolver();
-    this._reverb.buffer = buildImpulseResponse(ctx);
+    // Drum bus: drums stay punchy and dry
+    const drumGain = new Tone.Gain(Tone.dbToGain(-2));
+    drumGain.connect(limiter);
+    this._drumBus = drumGain;
 
-    // Dry/wet mix
-    this._dryGain = ctx.createGain();
-    this._dryGain.gain.value = 1 - REVERB_MIX;
-    this._reverbGain = ctx.createGain();
-    this._reverbGain.gain.value = REVERB_MIX;
+    // Synth bus: subtle delay for all pads; per-voice reverb handles z→reverb
+    const synthDelay = new Tone.FeedbackDelay({ delayTime: 0.375, feedback: 0.35, wet: 0.2 });
+    synthDelay.connect(limiter);
+    const synthGain = new Tone.Gain(Tone.dbToGain(-4));
+    synthGain.connect(synthDelay);
+    this._synthBus = synthGain;
 
-    // Master limiter (DynamicsCompressor at extreme settings ≈ limiter)
-    this._masterGain = ctx.createGain();
-    this._masterGain.gain.value = 1.0;
-    const limiter = ctx.createDynamicsCompressor();
-    limiter.threshold.value = -3;
-    limiter.knee.value = 0;
-    limiter.ratio.value = 20;
-    limiter.attack.value = 0.001;
-    limiter.release.value = 0.1;
-
-    // Routing: voices → dryGain → masterGain
-    //          voices → reverb → reverbGain → masterGain
-    //          masterGain → limiter → destination
-    this._dryGain.connect(this._masterGain);
-    this._reverbGain.connect(this._masterGain);
-    this._reverb.connect(this._reverbGain);
-    this._masterGain.connect(limiter);
-    limiter.connect(ctx.destination);
-
-    // Voices connect to both dry and reverb sends
-    this._voiceDest = this._dryGain;  // voices connect here; also tap into reverb
+    // Start transport
+    const transport = Tone.getTransport();
+    transport.bpm.value = 120;
+    transport.start();
 
     this._ready = true;
-    console.log("[audio] AudioContext unlocked");
+    console.log("[audio] ready — transport @ 120 BPM");
   }
 
-  /**
-   * Called each frame with the current list of blocks.
-   * @param {Array} blocks
-   */
   update(blocks) {
     if (!this._ready) return;
 
-    const activeIds = new Set(blocks.map((b) => b.id));
+    const blue  = blocks.filter(b => b.color === "blue");
+    const other = blocks.filter(b => b.color !== "blue");
 
-    // Remove voices for blocks that disappeared
-    for (const [id, voice] of this._voices) {
-      if (!activeIds.has(id)) {
-        voice.release();
-        this._voices.delete(id);
-      }
+    this._syncVoices(
+      blue, this._drumVoices,
+      (b) => new DrumVoice(b, this._drumBus),
+      (v) => v.dispose(),
+    );
+    this._syncVoices(
+      other, this._synthVoices,
+      (b) => new SynthVoice(b, this._synthBus),
+      (v) => v.release(),
+    );
+  }
+
+  /** Create new voices, update existing, remove gone — shared by both voice types. */
+  _syncVoices(blocks, voices, create, remove) {
+    const ids = new Set(blocks.map(b => b.id));
+    for (const [id, voice] of voices) {
+      if (!ids.has(id)) { remove(voice); voices.delete(id); }
     }
-
-    // Add or update voices for current blocks
     for (const block of blocks) {
-      if (!this._voices.has(block.id)) {
-        const voice = new Voice(this._ctx, this._voiceDest);
-        // Also send to reverb
-        voice.panner.connect(this._reverb);
-        this._voices.set(block.id, voice);
+      if (!voices.has(block.id)) {
+        voices.set(block.id, create(block));
+      } else {
+        voices.get(block.id).update(block);
       }
-      this._voices.get(block.id).update(block);
     }
   }
 }

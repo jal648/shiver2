@@ -8,14 +8,20 @@
  * `update(blocks)` is called each animation frame with the latest block data.
  */
 
-const BLOCK_COLOR = "#e8f4ff";
-const BLOCK_GLOW_COLOR = "rgba(100, 180, 255, 0.4)";
+const BLOCK_COLORS = {
+  red:     { fill: "#ff4444", glow: "rgba(255, 60,  60,  0.4)", particle: "#ff8888" },
+  blue:    { fill: "#4488ff", glow: "rgba(60,  100, 255, 0.4)", particle: "#88bbff" },
+  green:   { fill: "#44cc66", glow: "rgba(60,  200, 100, 0.4)", particle: "#88ffaa" },
+  yellow:  { fill: "#ffdd44", glow: "rgba(255, 220, 50,  0.4)", particle: "#ffee88" },
+  unknown: { fill: "#e8f4ff", glow: "rgba(100, 180, 255, 0.4)", particle: "#a0d8ff" },
+};
+
 const PARTICLE_LIFETIME = 1500;  // ms
 const PARTICLE_SPAWN_SPEED = 0.01;  // min velocity to spawn particles
 
 // ── Particle ──────────────────────────────────────────────────────────────────
 class Particle {
-  constructor(x, y, vx, vy) {
+  constructor(x, y, vx, vy, color = "#a0d8ff") {
     this.x = x;
     this.y = y;
     this.vx = (vx * 0.3 + (Math.random() - 0.5) * 0.005);
@@ -23,6 +29,7 @@ class Particle {
     this.alpha = 1.0;
     this.radius = 2 + Math.random() * 4;
     this.born = performance.now();
+    this.color = color;
   }
 
   /** Returns false when the particle should be removed. */
@@ -39,7 +46,7 @@ class Particle {
   draw(ctx, w, h) {
     ctx.save();
     ctx.globalAlpha = this.alpha * 0.8;
-    ctx.fillStyle = "#a0d8ff";
+    ctx.fillStyle = this.color;
     ctx.beginPath();
     ctx.arc(this.x * w, this.y * h, this.radius, 0, Math.PI * 2);
     ctx.fill();
@@ -58,6 +65,7 @@ export class Visualizer {
     this._blocks = [];
     this._particles = [];
     this._prevBlocks = new Map();  // id → prev block, for velocity reference
+    this._zone = null;
     this._running = false;
   }
 
@@ -76,7 +84,8 @@ export class Visualizer {
    * Called by main.js when new block data arrives from the WebSocket.
    * @param {Array} blocks
    */
-  update(blocks) {
+  update(blocks, zone) {
+    if (zone) this._zone = zone;
     this._spawnParticles(blocks);
     this._blocks = blocks;
 
@@ -105,6 +114,17 @@ export class Visualizer {
     this._particles = this._particles.filter((p) => p.tick(now, w, h));
     for (const p of this._particles) p.draw(ctx, w, h);
 
+    // Draw active zone boundary
+    if (this._zone) {
+      const { x, y, w: zw, h: zh } = this._zone;
+      ctx.save();
+      ctx.strokeStyle = "rgba(0, 255, 200, 0.5)";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 5]);
+      ctx.strokeRect(x * w, y * h, zw * w, zh * h);
+      ctx.restore();
+    }
+
     // Draw blocks
     for (const block of this._blocks) {
       this._drawBlock(block, w, h);
@@ -119,11 +139,12 @@ export class Visualizer {
     const cy = block.y * h;
     const bw = block.w * w;
     const bh = block.h * h;
+    const palette = BLOCK_COLORS[block.color] ?? BLOCK_COLORS.unknown;
 
     // Glow
     const glowSize = Math.hypot(block.vx, block.vy) * 500 + 20;
     const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowSize);
-    gradient.addColorStop(0, BLOCK_GLOW_COLOR);
+    gradient.addColorStop(0, palette.glow);
     gradient.addColorStop(1, "transparent");
     ctx.fillStyle = gradient;
     ctx.beginPath();
@@ -132,8 +153,8 @@ export class Visualizer {
 
     // Block rectangle
     ctx.save();
-    ctx.fillStyle = BLOCK_COLOR;
-    ctx.shadowColor = "#80c8ff";
+    ctx.fillStyle = palette.fill;
+    ctx.shadowColor = palette.fill;
     ctx.shadowBlur = 12;
     ctx.fillRect(cx - bw / 2, cy - bh / 2, bw, bh);
 
@@ -152,8 +173,9 @@ export class Visualizer {
       const speed = Math.hypot(block.vx, block.vy);
       if (speed > PARTICLE_SPAWN_SPEED) {
         const count = Math.min(Math.floor(speed * 20), 8);
+        const particleColor = (BLOCK_COLORS[block.color] ?? BLOCK_COLORS.unknown).particle;
         for (let i = 0; i < count; i++) {
-          this._particles.push(new Particle(block.x, block.y, block.vx, block.vy));
+          this._particles.push(new Particle(block.x, block.y, block.vx, block.vy, particleColor));
         }
       }
     }

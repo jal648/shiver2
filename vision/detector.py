@@ -2,12 +2,16 @@
 Block detector — finds bright Duplo blocks on a matte black table.
 
 Pipeline (per color):
-  BGR frame → HSV → per-color narrow mask → morphological cleanup
+  BGR frame → channel-ratio mask → morphological cleanup
   → contour detection → area/aspect filter → NMS dedup
   → stable ID assignment
 
+Detection uses BGR channel ratio: for a red block, the R channel must
+exceed a brightness floor AND account for more than `ratio`% of the total
+R+G+B light. This handles off-primary colors (lime green, cyan blue) that
+the simple margin approach misses.
+
 Color is implicit: each block inherits the name of the mask it came from.
-No post-hoc classification step needed.
 """
 
 import time
@@ -27,19 +31,21 @@ class Block:
     h: float   # normalized height
     vx: float = 0.0   # velocity (change per second)
     vy: float = 0.0
-    color: str = "unknown"  # "red" | "blue" | "green" | "yellow" | "unknown"
+    color: str = "unknown"  # "red" | "green" | "blue" | "unknown"
 
 
-# Default per-color HSV ranges — each entry: [name, h_lo, h_hi, s_min, v_min]
-# OpenCV HSV: H=0–180, S/V=0–255.
-# Red wraps around the hue circle so it has two entries.
+# Default per-color BGR ranges — each entry: [name, brightness_min, ratio]
+#   brightness_min : dominant channel must exceed this floor (0–255)
+#   ratio          : dominant channel as % of R+G+B must exceed this (0–100)
+#                    33 = any channel slightly dominant; 50 = fairly saturated
 DEFAULT_COLOR_RANGES: list[list] = [
-    ["red",    0,   10,  80,  80],
-    ["red",    170, 180, 80,  80],
-    ["yellow", 20,  38,  80,  100],
-    ["green",  40,  80,  80,  50],
-    ["blue",   100, 130, 80,  50],
+    ["red",   80, 38],   # 38% → tolerates pinkish-red
+    ["green", 60, 33],   # 33% → tolerates lime green
+    ["blue",  80, 38],   # 38% → tolerates cyan-blue
 ]
+
+# BGR channel index for each color (cv2.split returns b, g, r)
+_DOMINANT_IDX = {"red": 2, "green": 1, "blue": 0}
 
 
 def _nms(
@@ -49,7 +55,6 @@ def _nms(
     """
     Remove duplicate detections of the same color that are too close together.
 
-    Needed because red has two H-range entries; both may fire on the same block.
     Greedy: keep largest-area detection first, suppress anything within
     `threshold` normalized units of the same color.
 
@@ -76,12 +81,9 @@ class BlockDetector:
     Detects Duplo blocks in a camera frame and tracks them across frames
     with stable IDs via nearest-neighbour matching.
 
-    Detection uses per-color narrow HSV masks processed independently, so each
-    block's color is determined by which mask it came from — no post-hoc
-    classification step is needed.
-
-    Red's two H-range entries (0-10 and 170-180) are automatically deduped
-    using NMS so a single red block is never reported twice.
+    Detection uses BGR channel dominance — each color's dominant channel
+    (R for red, G for green, B for blue) must clear a brightness floor
+    and exceed the other two channels by a configurable margin.
     """
 
     def __init__(
@@ -111,33 +113,43 @@ class BlockDetector:
         self.last_detection_count = 0
 
     # ------------------------------------------------------------------
-    def _color_mask(self, name: str, hsv: np.ndarray) -> np.ndarray:
-        """Return binary mask for one named color (OR of its H-range entries)."""
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for n, h_lo, h_hi, s_min, v_min in self.color_ranges:
-            if n == name:
-                mask = cv2.bitwise_or(
-                    mask,
-                    cv2.inRange(
-                        hsv,
-                        np.array([h_lo, s_min, v_min], dtype=np.uint8),
-                        np.array([h_hi, 255,   255  ], dtype=np.uint8),
-                    ),
-                )
-        return mask
+    def _color_mask(self, name: str, frame: np.ndarray) -> np.ndarray:
+        """Return binary mask using BGR channel ratio for one named color.
+
+        A pixel passes if its dominant channel exceeds `brightness_min` AND
+        accounts for more than `ratio`% of the total R+G+B light.  The ratio
+        criterion handles off-primary colours (lime green, cyan blue) that a
+        simple per-channel margin would miss.
+        """
+        dom_idx = _DOMINANT_IDX.get(name)
+        if dom_idx is None:
+            return np.zeros(frame.shape[:2], dtype=np.uint8)
+
+        channels = cv2.split(frame)   # (b, g, r)
+        for n, brightness_min, ratio in self.color_ranges:
+            if n != name:
+                continue
+            dominant  = channels[dom_idx].astype(np.int32)
+            total     = (channels[0].astype(np.int32)
+                       + channels[1].astype(np.int32)
+                       + channels[2].astype(np.int32) + 1)
+            ratio_pct = (dominant * 100) // total   # 0–100
+            return (
+                (dominant > brightness_min) & (ratio_pct > ratio)
+            ).astype(np.uint8) * 255
+
+        return np.zeros(frame.shape[:2], dtype=np.uint8)
 
     # ------------------------------------------------------------------
-    def _make_binary(self, hsv: np.ndarray) -> np.ndarray:
-        """Return combined binary mask (OR of all color entries) — used by get_stages()."""
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for _, h_lo, h_hi, s_min, v_min in self.color_ranges:
-            m = cv2.inRange(
-                hsv,
-                np.array([h_lo, s_min, v_min], dtype=np.uint8),
-                np.array([h_hi, 255,   255  ], dtype=np.uint8),
-            )
-            mask = cv2.bitwise_or(mask, m)
-        return mask
+    def _make_binary(self, frame: np.ndarray) -> np.ndarray:
+        """Return combined binary mask (OR of all colors) — used by get_stages()."""
+        combined = np.zeros(frame.shape[:2], dtype=np.uint8)
+        seen: set[str] = set()
+        for name, *_ in self.color_ranges:
+            if name not in seen:
+                seen.add(name)
+                combined = cv2.bitwise_or(combined, self._color_mask(name, frame))
+        return combined
 
     # ------------------------------------------------------------------
     def get_color_edges(
@@ -151,8 +163,7 @@ class BlockDetector:
 
         Used by the debug edge-view overlay.
         """
-        hsv     = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        raw     = self._color_mask(name, hsv)
+        raw     = self._color_mask(name, frame)
         kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         cleaned = cv2.morphologyEx(raw,     cv2.MORPH_OPEN,  kernel, iterations=2)
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -164,12 +175,10 @@ class BlockDetector:
         """
         Return intermediate pipeline images as BGR frames for the debug viewer.
 
-        Keys: binary, cleaned, hsv_h, hsv_s, hsv_v,
-              mask_red, mask_yellow, mask_green, mask_blue
+        Keys: binary, cleaned, ch_r, ch_g, ch_b,
+              mask_red, mask_green, mask_blue
         """
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        binary  = self._make_binary(hsv)
+        binary  = self._make_binary(frame)
         kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         cleaned = cv2.morphologyEx(binary,  cv2.MORPH_OPEN,  kernel, iterations=2)
         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -177,23 +186,17 @@ class BlockDetector:
         def gray_bgr(ch: np.ndarray) -> np.ndarray:
             return cv2.cvtColor(ch, cv2.COLOR_GRAY2BGR)
 
-        h_norm = (hsv[:, :, 0].astype(np.float32) * (255 / 180)).clip(0, 255).astype(np.uint8)
-        hsv_h_vis = cv2.cvtColor(
-            cv2.merge([h_norm,
-                       np.full_like(h_norm, 200),
-                       np.full_like(h_norm, 200)]),
-            cv2.COLOR_HSV2BGR,
-        )
+        b_ch, g_ch, r_ch = cv2.split(frame)
 
         stages: dict[str, np.ndarray] = {
             "binary":  gray_bgr(binary),
             "cleaned": gray_bgr(cleaned),
-            "hsv_h":   hsv_h_vis,
-            "hsv_s":   gray_bgr(hsv[:, :, 1]),
-            "hsv_v":   gray_bgr(hsv[:, :, 2]),
+            "ch_r":    gray_bgr(r_ch),
+            "ch_g":    gray_bgr(g_ch),
+            "ch_b":    gray_bgr(b_ch),
         }
-        for color in ("red", "yellow", "green", "blue"):
-            cm = self._color_mask(color, hsv)
+        for color in ("red", "green", "blue"):
+            cm = self._color_mask(color, frame)
             stages[f"mask_{color}"] = cv2.bitwise_and(frame, frame, mask=cm)
 
         return stages
@@ -203,8 +206,7 @@ class BlockDetector:
         """
         Process one BGR frame and return tracked blocks.
 
-        Iterates each color's HSV range independently. Blocks inherit the color
-        of the mask they came from — no post-hoc classification needed.
+        Uses BGR channel dominance per color — no HSV conversion needed.
 
         Args:
             frame: BGR image (already cropped to table ROI by caller)
@@ -214,19 +216,14 @@ class BlockDetector:
         """
         h, w     = frame.shape[:2]
         roi_area = w * h
-
-        hsv    = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        kernel   = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
         raw: list[tuple[float, float, float, float, str]] = []
         total_contours = 0
 
-        for name, h_lo, h_hi, s_min, v_min in self.color_ranges:
-            mask = cv2.inRange(
-                hsv,
-                np.array([h_lo, s_min, v_min], dtype=np.uint8),
-                np.array([h_hi, 255,   255  ], dtype=np.uint8),
-            )
+        for entry in self.color_ranges:
+            name = entry[0]
+            mask = self._color_mask(name, frame)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=2)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
@@ -247,7 +244,6 @@ class BlockDetector:
 
         self.last_contour_count = total_contours
 
-        # Remove duplicates (e.g. both red entries firing on same block)
         deduped = _nms(raw, threshold=0.05)
         self.last_detection_count = len(deduped)
 
@@ -311,9 +307,8 @@ class BlockDetector:
         """Draw detected block bounding boxes on a copy of the frame."""
         COLOR_BGR = {
             "red":     (0,   0,   255),
-            "blue":    (255, 80,  20),
             "green":   (0,   200, 50),
-            "yellow":  (0,   220, 255),
+            "blue":    (255, 80,  20),
             "unknown": (0,   255, 0),
         }
         out = frame.copy()

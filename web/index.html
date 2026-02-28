@@ -47,13 +47,65 @@
       font-size: 11px;
       pointer-events: none;
     }
+
+    #debug-panel {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      display: none;
+      flex-direction: column;
+      gap: 6px;
+      max-height: calc(100vh - 24px);
+      overflow-y: auto;
+      pointer-events: none;
+      z-index: 1;
+      user-select: all;
+    }
+
+    #debug-panel.visible { display: flex; }
+
+    .debug-block {
+      background: rgba(0, 0, 0, 0.75);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 11px;
+      line-height: 1.5;
+      white-space: pre;
+      color: #ccc;
+      min-width: 220px;
+    }
+
+    .debug-block .key   { color: #888; }
+    .debug-block .str   { color: #f9a; }
+    .debug-block .num   { color: #7df; }
+    .debug-block .label {
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 4px;
+      opacity: 0.5;
+    }
+
+    #debug-toggle-hint {
+      position: fixed;
+      bottom: 18px;
+      right: 12px;
+      color: rgba(255,255,255,0.18);
+      font-size: 10px;
+      font-family: monospace;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
   <canvas id="canvas"></canvas>
   <div id="status" class="status-connecting">connecting</div>
   <div id="hint">click to enable audio</div>
+  <div id="debug-panel"></div>
+  <div id="debug-toggle-hint">` = debug</div>
 
+  <script src="https://cdn.jsdelivr.net/npm/tone@14/build/Tone.js"></script>
   <script type="module" src="main.js"></script>
 </body>
 </html>
