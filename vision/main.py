@@ -311,7 +311,9 @@ def camera_loop(
                 )
                 cv2.imshow(DBG_WIN, np.hstack([annotated, panel]))
 
-                key = cv2.waitKey(1) & 0xFF
+                elapsed  = time.monotonic() - t_start
+                wait_ms  = max(1, int((frame_interval - elapsed) * 1000))
+                key = cv2.waitKey(wait_ms) & 0xFF
 
                 if key == 27:  # ESC
                     break

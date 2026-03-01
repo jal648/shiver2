@@ -3,8 +3,20 @@
   "max_area_frac": 0.08,
   "max_aspect": 4.0,
   "color_ranges": [
-    ["red",   80, 38],
-    ["green", 60, 33],
-    ["blue",  80, 38]
+    [
+      "red",
+      121,
+      38
+    ],
+    [
+      "green",
+      92,
+      33
+    ],
+    [
+      "blue",
+      134,
+      38
+    ]
   ]
 }

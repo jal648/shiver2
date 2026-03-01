@@ -1,40 +1,41 @@
 /**
- * audio.js — BPM-synced drum sequencer + pentatonic synth engine
+ * audio.js — BPM-synced voice engine
  *
- * Blue blocks  → DrumVoice  (Tone.Transport @ 120 BPM)
- *   y → drum type  (kick / snare / clap / open-hat / closed-hat)
- *   x → filter cutoff
- *   z → beat pattern  (0 = beat 1, 1 = beats 1+3, 2 = all four beats)
+ * Blue  → BlueVoice  — 808-style bass drum, throbs on every quarter note
+ *   y → pitch (low y = deep sub-bass, high y = tighter/higher)
  *
- * Other blocks → SynthVoice  (continuous pentatonic pads)
- *   x → pentatonic pitch  (A minor, A2–A4)
- *   y → filter cutoff  (bright at top, dark at bottom)
- *   color → waveform  (red=sawtooth, green=square, yellow=triangle)
- *   √(vx²+vy²) → volume
- *   z → reverb wet  (0=dry, 1=medium, 2=heavy)
+ * Red   → RedVoice   — Fat Van Halen "Jump" synth stab, quarter-note triggers
+ *   x → pentatonic pitch
+ *   y → filter brightness (low y = bright)
  *
- * Interface (same as before):
+ * Green → GreenVoice — Fast arpeggiator, 16th-note steps
+ *   y → note count in arpeggio (higher y = more notes)
+ *
+ * Interface:
  *   audio.unlock()        — call from first user gesture
  *   audio.update(blocks)  — call each frame with current block array
  */
 
 /* global Tone */
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Tuning constants (edit here to tweak timing & arp behaviour) ──────────────
 
-const PENTATONIC = ["A2", "C3", "D3", "E3", "G3", "A3", "C4", "D4", "E4", "G4", "A4"];
+const BPM = 130; // transport tempo
+const DRUM_SUBDIV = "4n"; // blue: kick fires on every quarter note
+const RED_SUBDIV = "2n"; // red:  synth stab fires on every quarter note
+const ARP_SUBDIV = "16n"; // green: arpeggiator step interval
+const ARP_NOTE_LEN = "4n"; // green: sustain length of each arp note
+const ARP_MIN_NOTES = 2; // green: notes in arp when y ≈ 0
+const ARP_MAX_NOTES = 8; // green: notes in arp when y = 1
+const ARP_START_IDX = 12; // green: start note index in NOTE_SCALE (12 = C4)
 
-const WAVEFORMS = { red: "sawtooth", green: "square", yellow: "triangle" };
+// Pentatonic scale shared by red (stabs) and green (arp)
+// const PENTATONIC = ["C3", "E3", "G3", "A3", "C4", "E4", "G4", "A4", "C5"];
+const NOTE_SCALE = "123456"
+  .split("")
+  .reduce((acc, i) => acc.concat("CEGB".split("").map((n) => n + i)), []);
 
-// Quarter-note beat patterns — null = skip, truthy = trigger
-const BEAT_PATTERNS = [
-  ["X", null, null, null],  // z=0: beat 1 only
-  ["X", null, "X",  null],  // z=1: beats 1 + 3
-  ["X", "X",  "X",  "X" ], // z=2: all four beats
-];
-
-const REVERB_WET = [0.0, 0.4, 0.85];
-
+console.log("Using note scale:" , NOTE_SCALE)
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Logarithmic interpolation: t=0 → minHz, t=1 → maxHz */
@@ -42,184 +43,149 @@ function logCutoff(t, minHz, maxHz) {
   return Math.exp(Math.log(minHz) + t * (Math.log(maxHz) - Math.log(minHz)));
 }
 
-/** Return drum type index 0–4 from y position */
-function drumTypeIdx(y) {
-  if (y < 0.2) return 0; // kick
-  if (y < 0.4) return 1; // snare
-  if (y < 0.6) return 2; // clap
-  if (y < 0.8) return 3; // open hi-hat
-  return 4;              // closed hi-hat
-}
-
 /** Return pentatonic note name for x in [0, 1] */
 function noteForX(x) {
-  const i = Math.round(x * (PENTATONIC.length - 1));
-  return PENTATONIC[Math.max(0, Math.min(i, PENTATONIC.length - 1))];
+  const i = Math.round(x * (NOTE_SCALE.length - 1));
+  return NOTE_SCALE[Math.max(0, Math.min(i, NOTE_SCALE.length - 1))];
 }
 
-// ── DrumVoice ─────────────────────────────────────────────────────────────────
+/** 808 kick pitch from y: low y → deep sub, high y → tighter */
+function kickNote(y) {
+  // A0 (MIDI 21) at y=0  →  A2 (MIDI 45) at y=1
+  const midi = 21 + Math.round(y * 24);
+  return Tone.Frequency(midi, "midi").toNote();
+}
 
-class DrumVoice {
+/** Number of arp notes for a given y */
+function arpNoteCount(y) {
+  return Math.max(ARP_MIN_NOTES, Math.round(y * ARP_MAX_NOTES));
+}
+
+// ── BlueVoice — 808 bass drum ─────────────────────────────────────────────────
+
+class BlueVoice {
   constructor(block, bus) {
-    this._typeIdx = -1; // force initial build
-    this._z = -1;       // force initial build
-    this._synth = null;
-    this._seq = null;
-    this._trigger = () => {};
+    this._note = kickNote(block.y);
 
-    this._filter = new Tone.Filter({ type: "lowpass", frequency: 2000, rolloff: -24 });
-    this._filter.connect(bus);
+    this._synth = new Tone.MembraneSynth({
+      pitchDecay: 0.5,
+      octaves: 5,
+      envelope: { attack: 0.001, decay: 0.9, sustain: 0.0, release: 0.1 },
+      volume: 0,
+    });
+    this._dist = new Tone.Distortion(0.15);
+    this._synth.chain(this._dist, bus);
 
-    this._buildSynth(drumTypeIdx(block.y));
-    this._buildSeq(block.z);
+    this._seq = new Tone.Sequence(
+      (time) => this._synth.triggerAttackRelease(this._note, "8n", time),
+      ["X"],
+      DRUM_SUBDIV,
+    );
+    this._seq.start(0);
+
     this.update(block);
   }
 
-  _buildSynth(typeIdx) {
-    if (typeIdx === this._typeIdx) return;
-    if (this._synth) { this._synth.disconnect(); this._synth.dispose(); }
-    this._typeIdx = typeIdx;
-
-    switch (typeIdx) {
-      case 0: { // kick — low thud, pitch drop
-        const s = new Tone.MembraneSynth({
-          pitchDecay: 0.08, octaves: 6,
-          envelope: { attack: 0.001, decay: 0.35, sustain: 0, release: 0.1 },
-          volume: -2,
-        });
-        this._trigger = (t) => s.triggerAttackRelease("C1", "16n", t);
-        this._synth = s;
-        break;
-      }
-      case 1: { // snare — white noise burst
-        const s = new Tone.NoiseSynth({
-          noise: { type: "white" },
-          envelope: { attack: 0.001, decay: 0.18, sustain: 0, release: 0.05 },
-          volume: -6,
-        });
-        this._trigger = (t) => s.triggerAttackRelease("16n", t);
-        this._synth = s;
-        break;
-      }
-      case 2: { // clap — pink noise, slightly softer
-        const s = new Tone.NoiseSynth({
-          noise: { type: "pink" },
-          envelope: { attack: 0.005, decay: 0.1, sustain: 0, release: 0.04 },
-          volume: -8,
-        });
-        this._trigger = (t) => s.triggerAttackRelease("16n", t);
-        this._synth = s;
-        break;
-      }
-      case 3: { // open hi-hat — longer metallic decay
-        const s = new Tone.MetalSynth({
-          frequency: 400, harmonicity: 5.1, modulationIndex: 32,
-          resonance: 4000, octaves: 1.5,
-          envelope: { attack: 0.001, decay: 0.5, release: 0.3 },
-          volume: -14,
-        });
-        this._trigger = (t) => s.triggerAttackRelease("8n", t);
-        this._synth = s;
-        break;
-      }
-      default: { // closed hi-hat — very short tick
-        const s = new Tone.MetalSynth({
-          frequency: 400, harmonicity: 5.1, modulationIndex: 32,
-          resonance: 4000, octaves: 1.5,
-          envelope: { attack: 0.001, decay: 0.07, release: 0.01 },
-          volume: -16,
-        });
-        this._trigger = (t) => s.triggerAttackRelease("32n", t);
-        this._synth = s;
-        break;
-      }
-    }
-    this._synth.connect(this._filter);
-  }
-
-  _buildSeq(z) {
-    if (this._seq) { this._seq.stop(); this._seq.dispose(); }
-    const pattern = BEAT_PATTERNS[z] ?? BEAT_PATTERNS[0];
-    this._seq = new Tone.Sequence(
-      (time, val) => { if (val) this._trigger(time); },
-      pattern,
-      "4n",
-    );
-    this._seq.start(0);
-    this._z = z;
-  }
-
   update(block) {
-    const t = drumTypeIdx(block.y);
-    if (t !== this._typeIdx) this._buildSynth(t);
-    if (block.z !== this._z) this._buildSeq(block.z);
-    this._filter.frequency.rampTo(logCutoff(block.x, 400, 8000), 0.1);
+    this._note = kickNote(block.y);
   }
 
   dispose() {
-    if (this._seq)   { this._seq.stop(); this._seq.dispose(); }
-    if (this._synth) { this._synth.disconnect(); this._synth.dispose(); }
+    this._seq.stop();
+    this._seq.dispose();
+    this._synth.disconnect();
+    this._synth.dispose();
+    this._dist.dispose();
+  }
+}
+
+// ── RedVoice — Jump / fatsawtooth synth stab ──────────────────────────────────
+
+class RedVoice {
+  constructor(block, bus) {
+    this._note = noteForX(block.x);
+
+    this._synth = new Tone.PolySynth(Tone.Synth, {
+      oscillator: { type: "fatsawtooth", count: 3, spread: 30 },
+      envelope: {
+        attack: 0.01,
+        decay: 0.1,
+        sustain: 0.5,
+        release: 0.4,
+        attackCurve: "exponential",
+      },
+    });
+    this._filter = new Tone.Filter({
+      type: "lowpass",
+      frequency: 4000,
+      rolloff: -12,
+    });
+    this._synth.chain(this._filter, bus);
+
+    this._seq = new Tone.Sequence(
+      (time) => this._synth.triggerAttackRelease(this._note, "8n", time),
+      ["X"],
+      RED_SUBDIV,
+    );
+    this._seq.start(0);
+
+    this.update(block);
+  }
+
+  update(block) {
+    this._note = noteForX(block.x);
+    this._filter.frequency.rampTo(logCutoff(1 - block.y, 300, 8000), 0.1);
+  }
+
+  dispose() {
+    this._seq.stop();
+    this._seq.dispose();
+    this._synth.disconnect();
+    this._synth.dispose();
     this._filter.dispose();
   }
 }
 
-// ── SynthVoice ────────────────────────────────────────────────────────────────
+// ── GreenVoice — fast arpeggiator ─────────────────────────────────────────────
 
-class SynthVoice {
+class GreenVoice {
   constructor(block, bus) {
-    this._z = -1;
-    const type = WAVEFORMS[block.color] ?? "sine";
+    this._lastCount = 0; // force initial pattern set
 
-    this._synth  = new Tone.Synth({
-      oscillator: { type },
-      envelope: { attack: 0.5, decay: 0.2, sustain: 0.85, release: 3.0 },
-      portamento: 0.08,
+    this._synth = new Tone.Synth({
+      oscillator: { type: "triangle" },
+      envelope: { attack: 0.005, decay: 0.12, sustain: 0.0, release: 0.1 },
     });
-    this._filter = new Tone.Filter({ type: "lowpass", frequency: 3000, rolloff: -12 });
-    this._reverb = new Tone.Reverb({ decay: 3.5, wet: 0.0 });
-    this._panner = new Tone.Panner(0);
-    this._gain   = new Tone.Gain(Tone.dbToGain(-18));
+    this._reverb = new Tone.Reverb({ decay: 2.0, wet: 0.4 });
+    this._synth.chain(this._reverb, bus);
+    const arpStartIx = Math.floor(Math.random()*10)+4;
+    const initNotes = NOTE_SCALE.slice(arpStartIx, arpStartIx + ARP_MIN_NOTES);
+    this._pattern = new Tone.Pattern(
+      (time, note) =>
+        this._synth.triggerAttackRelease(note, ARP_NOTE_LEN, time),
+      initNotes,
+      "up",
+    );
+    this._pattern.interval = ARP_SUBDIV;
+    this._pattern.start(0);
 
-    this._synth.chain(this._filter, this._reverb, this._panner, this._gain, bus);
-    this._synth.triggerAttack(noteForX(block.x));
     this.update(block);
   }
 
   update(block) {
-    // Pentatonic pitch from x
-    this._synth.frequency.rampTo(
-      Tone.Frequency(noteForX(block.x)).toFrequency(), 0.1,
-    );
-
-    // Filter cutoff from y — bright at top (y≈0), dark at bottom (y≈1)
-    this._filter.frequency.rampTo(logCutoff(1 - block.y, 200, 6000), 0.2);
-
-    // Volume from velocity magnitude
-    const mag = Math.hypot(block.vx, block.vy);
-    const db  = -20 + Math.min(mag / 0.4, 1) * 14; // -20 dB still → -6 dB fast
-    this._gain.gain.rampTo(Tone.dbToGain(db), 0.15);
-
-    // Stereo pan from x
-    this._panner.pan.rampTo(block.x * 2 - 1, 0.2);
-
-    // Reverb wet from z (only updated on change)
-    if (block.z !== this._z) {
-      this._z = block.z;
-      this._reverb.wet.rampTo(REVERB_WET[block.z] ?? 0, 0.3);
+    const count = arpNoteCount(block.y);
+    if (count !== this._lastCount) {
+      this._lastCount = count;
+      this._pattern.values = NOTE_SCALE.slice(ARP_START_IDX, ARP_START_IDX + count);
     }
   }
 
-  release() {
-    this._synth.triggerRelease();
-    setTimeout(() => {
-      try {
-        this._synth.dispose();
-        this._filter.dispose();
-        this._reverb.dispose();
-        this._panner.dispose();
-        this._gain.dispose();
-      } catch (_) { /* already disposed */ }
-    }, 5000);
+  dispose() {
+    this._pattern.stop();
+    this._pattern.dispose();
+    this._synth.disconnect();
+    this._synth.dispose();
+    this._reverb.dispose();
   }
 }
 
@@ -227,9 +193,10 @@ class SynthVoice {
 
 export class AudioEngine {
   constructor() {
-    this._drumVoices  = new Map(); // id → DrumVoice
-    this._synthVoices = new Map(); // id → SynthVoice
-    this._drumBus  = null;
+    this._drumVoices = new Map(); // id → BlueVoice
+    this._redVoices = new Map(); // id → RedVoice
+    this._greenVoices = new Map(); // id → GreenVoice
+    this._drumBus = null;
     this._synthBus = null;
     this._ready = false;
   }
@@ -240,50 +207,65 @@ export class AudioEngine {
 
     const limiter = new Tone.Limiter(-2).toDestination();
 
-    // Drum bus: drums stay punchy and dry
-    const drumGain = new Tone.Gain(Tone.dbToGain(-2));
+    // Drum bus — punchy and dry
+    const drumGain = new Tone.Gain(Tone.dbToGain(-4));
     drumGain.connect(limiter);
     this._drumBus = drumGain;
 
-    // Synth bus: subtle delay for all pads; per-voice reverb handles z→reverb
-    const synthDelay = new Tone.FeedbackDelay({ delayTime: 0.375, feedback: 0.35, wet: 0.2 });
+    // Synth bus — shared feedback delay adds space
+    const synthDelay = new Tone.FeedbackDelay({
+      delayTime: "8n",
+      feedback: 0.3,
+      wet: 0.15,
+    });
     synthDelay.connect(limiter);
     const synthGain = new Tone.Gain(Tone.dbToGain(-4));
     synthGain.connect(synthDelay);
     this._synthBus = synthGain;
 
-    // Start transport
     const transport = Tone.getTransport();
-    transport.bpm.value = 120;
+    transport.bpm.value = BPM;
     transport.start();
 
     this._ready = true;
-    console.log("[audio] ready — transport @ 120 BPM");
+    console.log(`[audio] ready — transport @ ${BPM} BPM`);
   }
 
   update(blocks) {
     if (!this._ready) return;
 
-    const blue  = blocks.filter(b => b.color === "blue");
-    const other = blocks.filter(b => b.color !== "blue");
+    const blue = blocks.filter((b) => b.color === "blue");
+    const red = blocks.filter((b) => b.color === "red");
+    const green = blocks.filter((b) => b.color === "green");
 
     this._syncVoices(
-      blue, this._drumVoices,
-      (b) => new DrumVoice(b, this._drumBus),
+      blue,
+      this._drumVoices,
+      (b) => new BlueVoice(b, this._drumBus),
       (v) => v.dispose(),
     );
     this._syncVoices(
-      other, this._synthVoices,
-      (b) => new SynthVoice(b, this._synthBus),
-      (v) => v.release(),
+      red,
+      this._redVoices,
+      (b) => new RedVoice(b, this._synthBus),
+      (v) => v.dispose(),
+    );
+    this._syncVoices(
+      green,
+      this._greenVoices,
+      (b) => new GreenVoice(b, this._synthBus),
+      (v) => v.dispose(),
     );
   }
 
-  /** Create new voices, update existing, remove gone — shared by both voice types. */
+  /** Create new voices, update existing, remove gone — shared by all voice types. */
   _syncVoices(blocks, voices, create, remove) {
-    const ids = new Set(blocks.map(b => b.id));
+    const ids = new Set(blocks.map((b) => b.id));
     for (const [id, voice] of voices) {
-      if (!ids.has(id)) { remove(voice); voices.delete(id); }
+      if (!ids.has(id)) {
+        remove(voice);
+        voices.delete(id);
+      }
     }
     for (const block of blocks) {
       if (!voices.has(block.id)) {
