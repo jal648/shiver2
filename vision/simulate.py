@@ -68,7 +68,7 @@ DOUBLE_CLICK_S = 0.30      # seconds between presses to count as double-click
 HEIGHT_SCALE = [1.0, 1.25, 1.5]   # visual block size multiplier per height
 HEIGHT_LABELS = ["", "↑", "↑↑"]  # shown above block for z > 0
 
-DUPLO_COLORS = ["red", "blue", "green", "yellow"]
+DUPLO_COLORS = ["red", "blue", "green"]
 
 # Map Duplo color names → tkinter hex colors for the canvas
 TK_COLORS = {

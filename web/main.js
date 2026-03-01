@@ -11,6 +11,7 @@
 import { SocketClient } from "./socket.js";
 import { AudioEngine } from "./audio.js";
 import { Visualizer } from "./visual.js";
+import { FluidVisualizer } from "./FluidVisualizer.js";
 
 const canvas = document.getElementById("canvas");
 const statusEl = document.getElementById("status");
@@ -19,7 +20,17 @@ const debugPanel = document.getElementById("debug-panel");
 // ── Instantiate components ────────────────────────────────────────────────────
 const socket_url = `ws://${window.location.hostname}:8765`;
 const audio = new AudioEngine();
-const visual = new Visualizer(canvas);
+
+// Append ?fluid to URL to use the fluid simulation visualizer instead
+const searchParams = new URLSearchParams(location.search);
+const useFluid = searchParams.has("fluid");
+const visual = useFluid ? new FluidVisualizer(canvas) : new Visualizer(canvas);
+
+// Low-level fluid injection API (only active in fluid mode)
+if (useFluid) {
+  window.setFluidSource = (x, y, vx = 0, vy = 0, color = "unknown", density = 120) =>
+    visual._inject(x, y, vx, vy, color, density);
+}
 const socket = new SocketClient(socket_url, (status) => {
   statusEl.textContent = status;
   statusEl.className = `status-${status}`;
@@ -65,6 +76,12 @@ window.addEventListener("blocksUpdate", (event) => {
   updateDebugPanel(blocks);
 });
 
+window.addEventListener("beatPulse", (event) => {
+  if (!useFluid) return;
+  const { x, y, color, freq } = event.detail;
+  visual._pulse(x, y, color, freq);
+});
+
 // ── Unlock audio on first user interaction ────────────────────────────────────
 
 let audioUnlocked = false;
@@ -79,6 +96,51 @@ async function unlockAudio() {
 
 canvas.addEventListener("click", unlockAudio);
 canvas.addEventListener("touchstart", unlockAudio);
+
+// ── Idle detection — auto-pause/resume audio ──────────────────────────────────
+
+const IDLE_MS  = 10_000; // silence after this many ms of unchanged block positions
+const AWAKE_MS =  2_000; // re-check interval while paused (waiting for motion)
+
+let _idleTimer    = null;
+let _lastSnapshot = null; // null = not yet sampled
+
+function _blockSnapshot(blocks) {
+  // Stable string: sorted "id:x.xxx,y.xxx" pairs — cheap, deterministic
+  return blocks
+    .map(b => `${b.id}:${b.x.toFixed(3)},${b.y.toFixed(3)}`)
+    .sort()
+    .join("|");
+}
+
+function _scheduleIdleCheck(ms) {
+  clearTimeout(_idleTimer);
+  _idleTimer = setTimeout(_checkIdle, ms);
+}
+
+function _checkIdle() {
+  const current = _blockSnapshot(window._lastBlocks ?? []);
+
+  if (!audio.paused) {
+    if (_lastSnapshot !== null && current === _lastSnapshot) {
+      audio.pause();
+      _scheduleIdleCheck(AWAKE_MS);
+    } else {
+      _lastSnapshot = current;
+      _scheduleIdleCheck(IDLE_MS);
+    }
+  } else {
+    if (current !== _lastSnapshot) {
+      audio.resume();
+      _lastSnapshot = current;
+      _scheduleIdleCheck(IDLE_MS);
+    } else {
+      _scheduleIdleCheck(AWAKE_MS);
+    }
+  }
+}
+
+_scheduleIdleCheck(IDLE_MS);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
